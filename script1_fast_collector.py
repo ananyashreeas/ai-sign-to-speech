@@ -176,6 +176,10 @@ def main():
         print(f"[ERROR] Could not open webcam at index {WEBCAM_INDEX}.")
         return
 
+    WINDOW_NAME = "Fast Sign Data Collector"
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 800, 600)
+
     detector = HandDetector()
 
     current_idx = 0

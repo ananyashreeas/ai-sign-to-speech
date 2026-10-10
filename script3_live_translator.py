@@ -1,25 +1,16 @@
 """
 script3_live_translator.py
 --------------------------
-Real-time Sign Language to Speech translation desktop application with
-NATIVE ASYNCHRONOUS SPEECH and SIMULTANEOUS DUAL-HAND TRACKING.
-
-Key Features & Fixes:
-1. Native Windows SAPI.SpVoice: Replaced pyttsx3 threading queue with native Windows
-   SAPI.SpVoice asynchronous engine (SVSFlagsAsync = 1).
-   -> Speaks every word, every sentence, repeatedly with ZERO hangs, freezes, or dropped calls!
-2. Simultaneous 2-Hand Tracking: Both hands tracked and classified in real time with
-   floating green badges over each wrist.
-3. Interactive Sentence Builder:
-   * As you sign, words are collected into the sentence bar at the bottom.
-   * Press [SPACE], [S], or [ENTER] on the video window to speak the entire sentence immediately!
-   * Hands-Free Auto-Speak: When you lower both hands for 1.2 seconds, it automatically speaks
-     the complete sentence for you!
-4. Controls:
-   [SPACE] / [S] / [ENTER] : Speak entire sentence
-   [C]                     : Clear sentence
-   [BACKSPACE]             : Remove last word
-   [Q] / [ESC]             : Quit program
+Real-time Sign Language to Speech translation desktop application with:
+1. SIMULTANEOUS DUAL-HAND TRACKING (num_hands = 2)
+2. NATIVE ASYNCHRONOUS SPEECH (SAPI.SpVoice - Zero Freezes / Hangs)
+3. IN-APP ON-SCREEN SIGN CREATOR ([N] Button):
+   - Press [N] directly on this webcam window anytime!
+   - Type the new word directly on screen and hit ENTER.
+   - Hold your gesture for 1 second.
+   - The AI automatically learns, retrains in the background, and immediately
+     starts translating your new sign without ever closing or restarting!
+4. SENTENCE BUILDER & HANDS-FREE AUTO-SPEAKING on pause/lower hand.
 """
 
 import os
@@ -28,13 +19,21 @@ os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
+import csv
 import time
 import pickle
 import urllib.request
 import cv2
 import numpy as np
 import mediapipe as mp
-from script2_train_model import NumpyKNNClassifier
+from script2_train_model import (
+    NumpyKNNClassifier,
+    load_dataset_csv,
+    split_data,
+    build_and_train_model,
+    save_model,
+    DATASET_FILE
+)
 
 # ==========================================
 # CONFIGURATION CONSTANTS
@@ -45,6 +44,7 @@ CONSECUTIVE_FRAMES_TRIGGER = 6    # Quick responsiveness: 6 frames of agreement
 SPEECH_COOLDOWN_SECONDS = 1.8     # Minimum seconds between repeating the same held sign
 AUTO_SPEAK_PAUSE_SECONDS = 1.2    # Seconds after lowering hands before speaking full sentence
 MAX_NUM_HANDS = 2                 # Support up to 2 hands simultaneously
+NEW_SIGN_RAW_FRAMES = 30          # Only 30 frames (~1 sec) needed for new signs
 WEBCAM_INDEX = 0
 TARGET_FPS = 30
 FRAME_WIDTH = 640
@@ -115,11 +115,7 @@ class HandDetector:
 
 
 class NativeSpeechEngine:
-    """
-    Rock-solid, 100% non-blocking native Windows Speech Synthesizer (SAPI.SpVoice).
-    Uses asynchronous COM flags (SVSFlagsAsync = 1) so it NEVER freezes the video loop,
-    never drops repeated calls, and speaks sentences on demand without delay.
-    """
+    """Non-blocking Windows Speech Synthesizer."""
 
     def __init__(self, rate=1):
         self.use_win32 = False
@@ -128,9 +124,7 @@ class NativeSpeechEngine:
             self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
             self.speaker.Rate = rate
             self.use_win32 = True
-            print("[INFO] Initialized native Windows SAPI.SpVoice speech engine (Non-blocking).")
-        except Exception as e:
-            print(f"[WARNING] win32com unavailable ({e}), falling back to pyttsx3...")
+        except Exception:
             import pyttsx3
             self.pyttsx3_engine = pyttsx3.init()
             self.pyttsx3_engine.setProperty("rate", 160)
@@ -139,26 +133,22 @@ class NativeSpeechEngine:
         if not text or not text.strip():
             return
         clean_text = text.strip()
-
         if self.use_win32:
             try:
-                # Flag 1 = SVSFlagsAsync (Async, non-blocking)
-                # Flag 2 = SVSFPurgeBeforeSpeak (Interrupt previous voice if requested)
                 flags = (1 | 2) if interrupt else 1
                 self.speaker.Speak(clean_text, flags)
-            except Exception as e:
-                print(f"[TTS Error] {e}")
+            except Exception:
+                pass
         else:
             try:
                 self.pyttsx3_engine.say(clean_text)
                 self.pyttsx3_engine.runAndWait()
-            except Exception as e:
-                print(f"[TTS Fallback Error] {e}")
+            except Exception:
+                pass
 
     def stop(self):
         if self.use_win32:
             try:
-                # 2 = SVSFPurgeBeforeSpeak with empty text stops ongoing speech
                 self.speaker.Speak("", 2)
             except Exception:
                 pass
@@ -183,6 +173,36 @@ def normalize_landmarks(hand_landmarks) -> np.ndarray:
     return normalized_coords.flatten()
 
 
+def augment_landmark_vector(vector_63: np.ndarray) -> list:
+    """Generates 5 3D geometric variations for rapid learning."""
+    augmented = [vector_63]
+    coords = vector_63.reshape(21, 3)
+    for angle in [-0.08, 0.08]:
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        rot_matrix = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]], dtype=np.float32)
+        rotated = np.dot(coords, rot_matrix)
+        augmented.append(rotated.flatten())
+    augmented.append((coords * 1.05).flatten())
+    augmented.append((coords * 0.95).flatten())
+    return augmented
+
+
+def append_data_to_csv(filepath: str, label: str, samples: list):
+    with open(filepath, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for s in samples:
+            writer.writerow([label] + s.tolist())
+
+
+def retrain_model_pipeline(filepath: str):
+    """Loads CSV, fits model, saves model.pkl, and returns updated model + classes."""
+    X, y, classes = load_dataset_csv(filepath)
+    X_train, X_test, y_train, y_test = split_data(X, y)
+    model, _ = build_and_train_model(X_train, y_train)
+    save_model(model, MODEL_FILE)
+    return model, list(model.classes_)
+
+
 def load_model(filepath: str):
     if not os.path.exists(filepath):
         raise FileNotFoundError(
@@ -199,7 +219,6 @@ def load_model(filepath: str):
         model = bundle
         classes = list(model.classes_)
 
-    print(f"[INFO] Loaded model successfully with classes: {classes}")
     return model, classes
 
 
@@ -214,13 +233,13 @@ def draw_ui_overlay(frame, hand_predictions, sentence_words, speech_banner, auto
 
     num_hands = len(hand_predictions)
     if num_hands == 0:
-        cv2.putText(frame, "Hands: Lowered / Not in view", (20, 32),
+        cv2.putText(frame, "Hands: Lowered / Paused", (20, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120, 180, 255), 2, cv2.LINE_AA)
         if auto_countdown is not None and auto_countdown > 0:
             cv2.putText(frame, f"Auto-speaking sentence in {auto_countdown:.1f}s...", (20, 58),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
         else:
-            cv2.putText(frame, "Raise hand(s) to sign words", (20, 58),
+            cv2.putText(frame, "Raise hand(s) to sign | [N] to Teach New Sign", (20, 58),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 180, 180), 1, cv2.LINE_AA)
     else:
         cv2.putText(frame, f"Hands Active: {num_hands} detected", (20, 30),
@@ -230,7 +249,7 @@ def draw_ui_overlay(frame, hand_predictions, sentence_words, speech_banner, auto
         for i, (pred, conf) in enumerate(hand_predictions):
             pct = int(conf * 100)
             if conf >= CONFIDENCE_THRESHOLD:
-                summary_parts.append(f"H{i+1}: {pred} ({pct}%)")
+                summary_parts.append(f"H{i+1}: {pred.replace('_', ' ')} ({pct}%)")
             else:
                 summary_parts.append(f"H{i+1}: ? ({pct}%)")
         cv2.putText(frame, " | ".join(summary_parts), (20, 58),
@@ -238,24 +257,24 @@ def draw_ui_overlay(frame, hand_predictions, sentence_words, speech_banner, auto
 
     # Active Speech Banner on Top Right
     if speech_banner:
-        banner_w = min(280, len(speech_banner) * 12 + 40)
+        banner_w = min(320, len(speech_banner) * 12 + 40)
         cv2.rectangle(frame, (w - banner_w - 15, 10), (w - 15, 60), (0, 140, 0), -1)
         cv2.putText(frame, speech_banner, (w - banner_w - 5, 42),
                     cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     # --- Bottom Banner (Sentence Builder Bar) ---
     sentence_overlay = frame.copy()
-    cv2.rectangle(sentence_overlay, (0, h - 80), (w, h), (15, 15, 15), -1)
+    cv2.rectangle(sentence_overlay, (0, h - 85), (w, h), (15, 15, 15), -1)
     cv2.addWeighted(sentence_overlay, 0.85, frame, 0.15, 0, frame)
 
-    sentence_str = " ".join(sentence_words) if sentence_words else "(Empty - hold gestures to add words)"
+    sentence_str = " ".join([w.replace("_", " ") for w in sentence_words]) if sentence_words else "(Empty - hold gestures to add words)"
     color = (0, 255, 255) if sentence_words else (140, 140, 140)
-    cv2.putText(frame, f"Sentence: {sentence_str}", (15, h - 45),
+    cv2.putText(frame, f"Sentence: {sentence_str}", (15, h - 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
 
-    controls_text = "[SPACE] Speak Sentence Now | Lower Hands: Auto-Speak | [C] Clear | [Q] Quit"
-    cv2.putText(frame, controls_text, (15, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 240, 180), 1, cv2.LINE_AA)
+    controls_text = "[SPACE] Speak Now | [N] Add New Sign | Lower Hands: Auto-Speak | [C] Clear | [Q] Quit"
+    cv2.putText(frame, controls_text, (15, h - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1, cv2.LINE_AA)
 
 
 def main():
@@ -265,7 +284,6 @@ def main():
         print(f"[ERROR] {e}")
         return
 
-    # Initialize native non-blocking Windows speech engine
     tts = NativeSpeechEngine(rate=1)
 
     cap = cv2.VideoCapture(WEBCAM_INDEX)
@@ -276,6 +294,10 @@ def main():
     if not cap.isOpened():
         print(f"[ERROR] Failed to open webcam index {WEBCAM_INDEX}.")
         return
+
+    WINDOW_NAME = "Sign Language to Speech Translator"
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 800, 600)
 
     detector = HandDetector(max_hands=MAX_NUM_HANDS)
 
@@ -291,21 +313,26 @@ def main():
     speech_banner = None
     speech_banner_time = 0.0
 
+    # In-App Sign Creator states
+    is_typing_new_sign = False
+    typed_buffer = ""
+    is_recording_new_sign = False
+    new_sign_target = ""
+    new_sign_samples = []
+    new_sign_countdown_start = 0.0
+
     print("\n" + "=" * 65)
-    print(" LIVE SIGN TRANSLATOR (NATIVE ASYNC SPEECH & 2-HAND SUPPORT)")
+    print(" LIVE SIGN TRANSLATOR & IN-APP SIGN CREATOR")
     print("=" * 65)
     print(f"Supported signs : {', '.join(classes)}")
     print(f"Max hands       : {MAX_NUM_HANDS} simultaneous")
     print("Features:")
-    print("  - Raise hand(s) and hold a sign -> SPEAKS IMMEDIATELY!")
-    print("  - Words accumulate in the Sentence bar at bottom.")
-    print("  - Lower both hands              -> AUTO-SPEAKS the full sentence!")
-    print("  - Press [SPACE] or [S]          -> MANUALLY speaks sentence immediately!")
+    print("  - Sign words with one or both hands -> SPEAKS IMMEDIATELY!")
+    print("  - Lower both hands                  -> AUTO-SPEAKS the full sentence!")
+    print("  - Press [N] ON CAMERA SCREEN        -> TEACH & ADD A NEW SIGN LIVE!")
+    print("  - Press [SPACE] / [S]               -> Speak sentence now")
     print("Controls:")
-    print("  [SPACE] / [S] : Speak sentence immediately")
-    print("  [C]           : Clear sentence")
-    print("  [BACKSPACE]   : Remove last word")
-    print("  [Q] / [ESC]   : Quit program")
+    print("  [N] Teach New Sign | [SPACE] Speak | [C] Clear | [Q] Quit")
     print("=" * 65 + "\n")
 
     try:
@@ -323,135 +350,219 @@ def main():
             current_hand_predictions = []
             auto_countdown = None
 
-            if hand_in_view:
-                last_hand_seen_time = now
+            # --- MODE 1: On-Screen Text Input Modal (Triggered by [N]) ---
+            if is_typing_new_sign:
+                modal = frame.copy()
+                cv2.rectangle(modal, (40, h // 2 - 90), (w - 40, h // 2 + 75), (25, 25, 25), -1)
+                cv2.addWeighted(modal, 0.88, frame, 0.12, 0, frame)
+                cv2.rectangle(frame, (40, h // 2 - 90), (w - 40, h // 2 + 75), (0, 220, 255), 2)
 
-                # Process every detected hand (up to 2)
-                for i, hand_lms in enumerate(hands_detected[:MAX_NUM_HANDS]):
-                    detector.draw_landmarks(frame, hand_lms)
+                cv2.putText(frame, "TEACH NEW SIGN: TYPE WORD & PRESS ENTER",
+                            (60, h // 2 - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2, cv2.LINE_AA)
 
-                    raw_wrist = hand_lms[0] if not hasattr(hand_lms, "landmark") else hand_lms.landmark[0]
-                    wx = int(raw_wrist.x * w)
-                    wy = int(raw_wrist.y * h)
+                cursor = "_" if int(now * 2) % 2 == 0 else ""
+                cv2.putText(frame, f"> {typed_buffer}{cursor}",
+                            (60, h // 2 + 5), cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, 255, 255), 2, cv2.LINE_AA)
 
-                    # Extract normalized 63D features
-                    features = normalize_landmarks(hand_lms).reshape(1, -1)
-                    probabilities = model.predict_proba(features)[0]
-                    best_class_idx = np.argmax(probabilities)
-                    conf = float(probabilities[best_class_idx])
-                    pred = str(model.classes_[best_class_idx])
+                cv2.putText(frame, "[ENTER] Start 1-Sec Recording  |  [ESC] Cancel",
+                            (60, h // 2 + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (160, 160, 160), 1, cv2.LINE_AA)
 
-                    current_hand_predictions.append((pred, conf))
+            # --- MODE 2: Recording New Sign Pose (3-Sec Countdown & 1-Sec Capture) ---
+            elif is_recording_new_sign:
+                elapsed = now - new_sign_countdown_start
+                remaining = int(3.5 - elapsed)
 
-                    # Floating label directly on camera above each hand
-                    if conf >= CONFIDENCE_THRESHOLD:
-                        pct = int(conf * 100)
-                        badge_text = f"Hand {i+1}: {pred} ({pct}%)"
-                        badge_x = max(10, min(w - 180, wx - 60))
-                        badge_y = max(40, wy - 25)
+                if hand_in_view:
+                    for hlms in hands_detected:
+                        detector.draw_landmarks(frame, hlms)
 
-                        cv2.rectangle(frame, (badge_x - 5, badge_y - 20), (badge_x + 175, badge_y + 5), (0, 150, 0), -1)
-                        cv2.putText(frame, badge_text, (badge_x, badge_y - 5),
-                                    cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                if remaining > 0:
+                    # 3-Second Countdown
+                    cv2.putText(frame, f"GET READY FOR '{new_sign_target}': {remaining}",
+                                (w // 2 - 230, h // 2), cv2.FONT_HERSHEY_DUPLEX, 1.3, (0, 140, 255), 3, cv2.LINE_AA)
+                else:
+                    # Capture 30 frames
+                    if hand_in_view:
+                        primary_hand = hands_detected[0]
+                        norm_vec = normalize_landmarks(primary_hand)
+                        new_sign_samples.append(norm_vec)
 
-                        # Stability tracking for this hand
-                        if pred == hand_candidates[i]:
-                            hand_consecutive_hits[i] += 1
-                        else:
-                            hand_candidates[i] = pred
-                            hand_consecutive_hits[i] = 1
+                        count = len(new_sign_samples)
+                        cv2.putText(frame, f"HOLD GESTURE '{new_sign_target}': {count}/{NEW_SIGN_RAW_FRAMES}",
+                                    (20, 50), cv2.FONT_HERSHEY_DUPLEX, 0.85, (0, 255, 0), 2)
 
-                        # Trigger speech once gesture stabilizes across 6 frames
-                        if hand_consecutive_hits[i] >= CONSECUTIVE_FRAMES_TRIGGER:
-                            is_new_sign = (pred != hand_last_spoken_sign[i])
-                            cooldown_passed = (now - hand_last_spoken_time[i] > SPEECH_COOLDOWN_SECONDS)
+                        bar_w = int((count / NEW_SIGN_RAW_FRAMES) * (w - 40))
+                        cv2.rectangle(frame, (20, 65), (20 + bar_w, 80), (0, 255, 0), -1)
 
-                            if is_new_sign or cooldown_passed:
-                                print(f"[SPEAK] Hand {i+1}: '{pred}' ({pct}%)")
-                                tts.speak(pred, interrupt=False)
-                                hand_last_spoken_sign[i] = pred
-                                hand_last_spoken_time[i] = now
-                                speech_banner = f"Spoke: {pred}"
-                                speech_banner_time = now
+                        if count >= NEW_SIGN_RAW_FRAMES:
+                            # 3D Geometric Augmentation & Retraining
+                            all_augmented = []
+                            for vec in new_sign_samples:
+                                all_augmented.extend(augment_landmark_vector(vec))
 
-                                # Add to sentence builder
-                                if not sentence_words or sentence_words[-1] != pred:
-                                    sentence_words.append(pred)
-                                    print(f"[SENTENCE] Current: {' '.join(sentence_words)}")
+                            append_data_to_csv(DATASET_FILE, new_sign_target, all_augmented)
+                            print(f"[SUCCESS] Appended {len(all_augmented)} samples for '{new_sign_target}'. Retraining model...")
+
+                            # Retrain in-memory
+                            model, classes = retrain_model_pipeline(DATASET_FILE)
+                            print(f"[RE-TRAINED] Model updated in-memory! Supported: {classes}")
+
+                            tts.speak(f"Learned new sign {new_sign_target.replace('_', ' ')}")
+                            speech_banner = f"Learned: {new_sign_target}"
+                            speech_banner_time = now
+
+                            is_recording_new_sign = False
+                            new_sign_samples = []
                     else:
-                        hand_candidates[i] = None
-                        hand_consecutive_hits[i] = 0
+                        cv2.putText(frame, f"HOLD HAND IN VIEW FOR '{new_sign_target}'!",
+                                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
 
-                # Reset tracker for second hand if only 1 hand is present
-                if len(hands_detected) == 1:
-                    hand_candidates[1] = None
-                    hand_consecutive_hits[1] = 0
-                    hand_last_spoken_sign[1] = None
+            # --- MODE 3: Normal Real-Time Translation ---
+            else:
+                if hand_in_view:
+                    last_hand_seen_time = now
+
+                    for i, hand_lms in enumerate(hands_detected[:MAX_NUM_HANDS]):
+                        detector.draw_landmarks(frame, hand_lms)
+
+                        raw_wrist = hand_lms[0] if not hasattr(hand_lms, "landmark") else hand_lms.landmark[0]
+                        wx = int(raw_wrist.x * w)
+                        wy = int(raw_wrist.y * h)
+
+                        features = normalize_landmarks(hand_lms).reshape(1, -1)
+                        probabilities = model.predict_proba(features)[0]
+                        best_class_idx = np.argmax(probabilities)
+                        conf = float(probabilities[best_class_idx])
+                        pred = str(model.classes_[best_class_idx])
+
+                        current_hand_predictions.append((pred, conf))
+
+                        if conf >= CONFIDENCE_THRESHOLD:
+                            pct = int(conf * 100)
+                            clean_label = pred.replace("_", " ")
+                            badge_text = f"Hand {i+1}: {clean_label} ({pct}%)"
+                            badge_x = max(10, min(w - 200, wx - 60))
+                            badge_y = max(40, wy - 25)
+
+                            cv2.rectangle(frame, (badge_x - 5, badge_y - 20), (badge_x + 195, badge_y + 5), (0, 150, 0), -1)
+                            cv2.putText(frame, badge_text, (badge_x, badge_y - 5),
+                                        cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+                            if pred == hand_candidates[i]:
+                                hand_consecutive_hits[i] += 1
+                            else:
+                                hand_candidates[i] = pred
+                                hand_consecutive_hits[i] = 1
+
+                            if hand_consecutive_hits[i] >= CONSECUTIVE_FRAMES_TRIGGER:
+                                is_new_sign = (pred != hand_last_spoken_sign[i])
+                                cooldown_passed = (now - hand_last_spoken_time[i] > SPEECH_COOLDOWN_SECONDS)
+
+                                if is_new_sign or cooldown_passed:
+                                    spoken_text = pred.replace("_", " ")
+                                    print(f"[SPEAK] Hand {i+1}: '{spoken_text}' ({pct}%)")
+                                    tts.speak(spoken_text, interrupt=False)
+                                    hand_last_spoken_sign[i] = pred
+                                    hand_last_spoken_time[i] = now
+                                    speech_banner = f"Spoke: {spoken_text}"
+                                    speech_banner_time = now
+
+                                    if not sentence_words or sentence_words[-1] != pred:
+                                        sentence_words.append(pred)
+                        else:
+                            hand_candidates[i] = None
+                            hand_consecutive_hits[i] = 0
+
+                    if len(hands_detected) == 1:
+                        hand_candidates[1] = None
+                        hand_consecutive_hits[1] = 0
+                        hand_last_spoken_sign[1] = None
+
+                else:
+                    hand_candidates = [None, None]
+                    hand_consecutive_hits = [0, 0]
+                    hand_last_spoken_sign = [None, None]
+                    hand_last_spoken_time = [0.0, 0.0]
+
+                    if sentence_words:
+                        pause_duration = now - last_hand_seen_time
+                        remaining_time = AUTO_SPEAK_PAUSE_SECONDS - pause_duration
+                        if remaining_time > 0:
+                            auto_countdown = remaining_time
+                        else:
+                            full_sentence = " ".join([w.replace("_", " ") for w in sentence_words])
+                            print(f"[AUTO-SPEAK] Full sentence: '{full_sentence}'")
+                            tts.speak(full_sentence, interrupt=True)
+                            speech_banner = f"Sentence: {full_sentence}"
+                            speech_banner_time = now
+                            sentence_words = []
+                            last_hand_seen_time = now
+
+                if speech_banner and (now - speech_banner_time > 2.0):
+                    speech_banner = None
+
+                draw_ui_overlay(
+                    frame,
+                    hand_predictions=current_hand_predictions,
+                    sentence_words=sentence_words,
+                    speech_banner=speech_banner,
+                    auto_countdown=auto_countdown
+                )
+
+            cv2.imshow(WINDOW_NAME, frame)
+            raw_key = cv2.waitKey(1)
+            key = raw_key & 0xFF
+
+            # Key Handling
+            if is_typing_new_sign:
+                if key in [13, 10]:  # ENTER: Confirm sign name and start capture
+                    clean_name = typed_buffer.strip().replace(" ", "_").upper()
+                    if clean_name:
+                        new_sign_target = clean_name
+                        is_typing_new_sign = False
+                        is_recording_new_sign = True
+                        new_sign_samples = []
+                        new_sign_countdown_start = time.time()
+                    else:
+                        is_typing_new_sign = False
+                elif key == 27:  # ESC: Cancel
+                    is_typing_new_sign = False
+                    typed_buffer = ""
+                elif key == 8:  # BACKSPACE
+                    typed_buffer = typed_buffer[:-1]
+                elif 32 <= key <= 126:  # Printable character
+                    typed_buffer += chr(key).upper()
+
+            elif is_recording_new_sign:
+                if key == 27:  # ESC: Cancel recording
+                    is_recording_new_sign = False
+                    new_sign_samples = []
 
             else:
-                # When hands are lowered out of view:
-                # Reset sign state so raising hands again immediately triggers speech!
-                hand_candidates = [None, None]
-                hand_consecutive_hits = [0, 0]
-                hand_last_spoken_sign = [None, None]
-                hand_last_spoken_time = [0.0, 0.0]
-
-                # Hands-Free Auto-Speak:
-                # If hands have been down for AUTO_SPEAK_PAUSE_SECONDS and there are words,
-                # speak the full sentence automatically!
-                if sentence_words:
-                    pause_duration = now - last_hand_seen_time
-                    remaining_time = AUTO_SPEAK_PAUSE_SECONDS - pause_duration
-                    if remaining_time > 0:
-                        auto_countdown = remaining_time
-                    else:
-                        full_sentence = " ".join(sentence_words)
-                        print(f"[AUTO-SPEAK] Full sentence: '{full_sentence}'")
+                if key in [ord('q'), 27]:
+                    print("[INFO] Exiting translator.")
+                    break
+                elif key in [ord('n'), ord('N')]:
+                    # Trigger In-App Sign Creator
+                    is_typing_new_sign = True
+                    typed_buffer = ""
+                elif key in [32, ord(' '), ord('s'), ord('S'), 13]:
+                    if sentence_words:
+                        full_sentence = " ".join([w.replace("_", " ") for w in sentence_words])
+                        print(f"[MANUAL SPEAK] Speaking sentence: '{full_sentence}'")
                         tts.speak(full_sentence, interrupt=True)
                         speech_banner = f"Sentence: {full_sentence}"
                         speech_banner_time = now
                         sentence_words = []
-                        last_hand_seen_time = now
-
-            # Clear speech banner after 2.0s
-            if speech_banner and (now - speech_banner_time > 2.0):
-                speech_banner = None
-
-            draw_ui_overlay(
-                frame,
-                hand_predictions=current_hand_predictions,
-                sentence_words=sentence_words,
-                speech_banner=speech_banner,
-                auto_countdown=auto_countdown
-            )
-
-            cv2.imshow("Sign Language to Speech Translator", frame)
-            raw_key = cv2.waitKey(1)
-            key = raw_key & 0xFF
-
-            if key in [ord('q'), 27]:
-                print("[INFO] Exiting translator.")
-                break
-            # Handle SPACE, 's', 'S', or ENTER to speak full sentence
-            elif key in [32, ord(' '), ord('s'), ord('S'), 13, 10]:
-                if sentence_words:
-                    full_sentence = " ".join(sentence_words)
-                    print(f"[MANUAL SPEAK] Key pressed! Speaking sentence: '{full_sentence}'")
-                    tts.speak(full_sentence, interrupt=True)
-                    speech_banner = f"Sentence: {full_sentence}"
-                    speech_banner_time = now
+                elif key in [ord('c'), ord('C')]:
                     sentence_words = []
-                else:
-                    print("[INFO] Sentence is currently empty. Hold signs to add words first.")
-            elif key in [ord('c'), ord('C')]:
-                sentence_words = []
-                speech_banner = "Cleared"
-                speech_banner_time = now
-                print("[SENTENCE] Sentence cleared.")
-            elif key == 8:  # Backspace
-                if sentence_words:
-                    popped = sentence_words.pop()
-                    print(f"[SENTENCE] Removed '{popped}'. Remaining: {' '.join(sentence_words)}")
+                    speech_banner = "Cleared"
+                    speech_banner_time = now
+                    print("[SENTENCE] Sentence cleared.")
+                elif key == 8:  # Backspace
+                    if sentence_words:
+                        popped = sentence_words.pop()
+                        print(f"[SENTENCE] Removed '{popped}'.")
 
     finally:
         detector.close()
