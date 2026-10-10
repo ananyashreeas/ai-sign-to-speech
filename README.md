@@ -1,5 +1,7 @@
 # 🤟 AI Sign Language to Speech Desktop Pipeline
 
+https://github.com/user-attachments/assets/ad24ef02-28b4-4355-abd0-e3814361a3eb
+
 An end-to-end, lightweight, and real-time assistive technology desktop application that bridges communication barriers by translating American Sign Language (ASL) and custom hand gestures into synthesized speech in real time.
 
 Built with **Python**, **OpenCV**, **MediaPipe Hands**, **Scikit-Learn**, and **Windows SAPI / pyttsx3**.
