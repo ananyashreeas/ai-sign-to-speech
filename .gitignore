@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+build/
+dist/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large model binaries (optional: users can commit model.pkl or download it)
+# hand_landmarker.task is auto-downloaded on first run
+hand_landmarker.task
